@@ -1,0 +1,223 @@
+--bronze 
+
+# read raw CSV as strings (keep messy)
+raw_df = spark.read.option("header","true").option("inferSchema","false").csv(csv_path)
+
+# write raw as parquet (bronze storage)
+raw_df.write.mode("overwrite").parquet(bronze_parquet_path)
+
+# save as Delta table (bronze)
+spark.read.parquet(bronze_parquet_path).write.format("delta").mode("overwrite").saveAsTable("retail_demo.bronze_orders")
+
+display(spark.table("retail_demo.bronze_orders").limit(10))
+
+
+--silver
+bronze = spark.table("retail_demo.bronze_orders")
+
+# try multiple date formats
+order_ts = coalesce(
+    to_timestamp(trim(col("order_date")), "yyyy-MM-dd"),
+    to_timestamp(trim(col("order_date")), "dd/MM/yyyy"),
+    to_timestamp(trim(col("order_date")), "d-MMM-yyyy"),
+    to_timestamp(trim(col("order_date")), "MM-dd-yyyy"),
+    to_timestamp(trim(col("order_date")), "dd-MM-yyyy")
+)
+
+clean_df = (
+    bronze
+    .withColumn("order_id", trim(col("order_id")).cast("long"))
+    .withColumn("order_date_ts", order_ts)
+    .withColumn("customer_id", trim(col("customer_id")))
+    .withColumn("customer_name", trim(col("customer_name")))
+    .withColumn("product_id", trim(col("product_id")))
+    .withColumn("product_name", lower(trim(col("product_name"))))
+    .withColumn("category", lower(trim(col("category"))))
+    # quantity: missing -> 1 ; cast to int ; negative/zero -> 1
+    .withColumn("quantity", when(trim(col("quantity")).isNull() | (trim(col("quantity"))==""), lit(1)).otherwise(trim(col("quantity"))))
+    .withColumn("quantity", col("quantity").cast("int"))
+    .withColumn("quantity", when(col("quantity") <= 0, lit(1)).otherwise(col("quantity")))
+    # price: remove $ and commas then cast to double
+    .withColumn("price_clean", translate(trim(col("price")), "$,", ""))
+    .withColumn("price", col("price_clean").cast("double"))
+    .drop("price_clean")
+    .withColumn("payment_type", lower(trim(col("payment_type"))))
+    .withColumn("order_status", lower(trim(col("order_status"))))
+    .withColumn("returned", lower(trim(col("returned"))))
+    # total_amount (sales) — if price null, set 0.0
+    .withColumn("total_amount", (coalesce(col("quantity"), lit(0)) * coalesce(col("price"), lit(0.0))).cast("double"))
+)
+
+# drop duplicates and rows missing keys
+clean_df = clean_df.dropDuplicates(["order_id", "product_id"]).filter(col("order_id").isNotNull() & col("product_id").isNotNull())
+
+# write silver table
+clean_df.write.format("delta").mode("overwrite").saveAsTable("retail_demo.silver_orders")
+
+display(spark.table("retail_demo.silver_orders").limit(20))
+
+
+
+-gold
+
+silver = spark.table("retail_demo.silver_orders")
+
+# add date parts to silver to group by
+silver2 = silver.withColumn("order_date", to_date(col("order_date_ts"))) \
+                .withColumn("year", year(col("order_date_ts"))) \
+                .withColumn("month", month(col("order_date_ts")))
+
+gold_df = (
+    silver2
+    .groupBy("product_id","product_name","customer_id","category","year","month","order_date")
+    .agg(
+        _sum("total_amount").alias("total_sales"),
+        _sum(coalesce(col("quantity"), lit(0))).alias("total_quantity"),
+        countDistinct("order_id").alias("total_orders"),
+        _min("price").alias("min_price"),
+        _max("price").alias("max_price"),
+        avg("price").alias("avg_unit_price"),
+        _min("order_date_ts").alias("first_order_date"),
+        _max("order_date_ts").alias("last_order_date"),
+        _sum(when(col("returned") == "yes", 1).otherwise(0)).alias("returned_count"),
+        _sum(when(col("returned") == "yes", col("total_amount")).otherwise(0.0)).alias("returned_amount"),
+        countDistinct("payment_type").alias("distinct_payment_types"),
+        first(col("customer_name"), True).alias("customer_name"),
+        countDistinct("product_id").alias("distinct_sku_in_group")  # often 1 but included for safety
+    )
+)
+
+# derived metrics
+gold_df = gold_df.withColumn("avg_order_value", when(col("total_orders")>0, col("total_sales")/col("total_orders")).otherwise(lit(0.0))) \
+                 .withColumn("avg_price_per_item", when(col("total_quantity")>0, col("total_sales")/col("total_quantity")).otherwise(lit(0.0))) \
+                 .withColumn("days_since_last_order", when(col("last_order_date").isNotNull(), datediff(current_date(), col("last_order_date"))).otherwise(lit(None))) \
+                 .withColumn("refreshed_at", current_timestamp())
+
+# cast/select final ordering
+gold_df = gold_df.select(
+    "product_id","product_name","category","customer_id","customer_name",
+    "year","month","order_date",
+    col("total_sales").cast("double"),
+    col("total_quantity").cast("long"),
+    col("total_orders").cast("long"),
+    col("avg_order_value").cast("double"),
+    col("avg_price_per_item").cast("double"),
+    col("min_price").cast("double"),
+    col("max_price").cast("double"),
+    col("avg_unit_price").cast("double"),
+    "first_order_date","last_order_date","days_since_last_order",
+    col("returned_count").cast("long"),
+    col("returned_amount").cast("double"),
+    col("distinct_payment_types").cast("long"),
+    col("distinct_sku_in_group").cast("long"),
+    "refreshed_at"
+)
+
+# save gold table (overwrite to refresh)
+gold_df.write.format("delta").mode("overwrite").saveAsTable("retail_demo.gold_aggregates")
+
+display(spark.table("retail_demo.gold_aggregates").orderBy(col("total_sales").desc()).limit(100))
+
+
+
+
+
+---kpis 
+
+gold = spark.table("retail_demo.gold_aggregates")
+silver = spark.table("retail_demo.silver_orders")
+
+# 1) Overall totals (safest from silver to avoid double-counting issues)
+overall = silver.agg(
+    _sum("total_amount").alias("total_revenue"),
+    countDistinct("order_id").alias("total_orders"),
+    _sum(coalesce(col("quantity"), lit(0))).alias("total_items"),
+    _sum(when(col("returned")=="yes", col("total_amount")).otherwise(0.0)).alias("total_returned_amount"),
+    countDistinct("customer_id").alias("total_customers")
+).collect()[0]
+
+total_revenue = float(overall["total_revenue"] or 0.0)
+total_orders = int(overall["total_orders"] or 0)
+total_items = int(overall["total_items"] or 0)
+total_returned_amount = float(overall["total_returned_amount"] or 0.0)
+total_customers = int(overall["total_customers"] or 0)
+
+avg_order_value = (total_revenue / total_orders) if total_orders>0 else 0.0
+avg_price_per_item = (total_revenue / total_items) if total_items>0 else 0.0
+avg_items_per_order = (total_items / total_orders) if total_orders>0 else 0.0
+
+# 2) Repeat customer rate & purchase frequency
+cust_orders = silver.groupBy("customer_id").agg(countDistinct("order_id").alias("orders_per_customer"))
+total_customers_calc = cust_orders.count()
+repeat_customers = cust_orders.filter(col("orders_per_customer") > 1).count()
+repeat_customer_rate = (repeat_customers / total_customers_calc) if total_customers_calc>0 else 0.0
+purchase_frequency = (total_orders / total_customers_calc) if total_customers_calc>0 else 0.0
+
+# 3) Return rate (by amount and count)
+returned_count_total = silver.filter(col("returned")=="yes").count()
+return_rate_count = (returned_count_total / total_items) if total_items>0 else 0.0
+return_rate_amount = (total_returned_amount / total_revenue) if total_revenue>0 else 0.0
+
+# 4) Top 10 products by revenue (from gold aggregated at product-level via SQL-like rollup)
+top_products = spark.sql("""
+    SELECT product_id, product_name, SUM(total_sales) AS revenue, SUM(total_quantity) AS quantity_sold
+    FROM retail_demo.gold_aggregates
+    GROUP BY product_id, product_name
+    ORDER BY revenue DESC
+    LIMIT 10
+""")
+top_products_list = [ (r["product_id"], r["product_name"], float(r["revenue"]), int(r["quantity_sold"])) for r in top_products.collect() ]
+
+# 5) Monthly revenue and month-over-month growth (derive from gold table)
+monthly = spark.sql("""
+    SELECT year, month, SUM(total_sales) AS monthly_revenue
+    FROM retail_demo.gold_aggregates
+    GROUP BY year, month
+    ORDER BY year, month
+""").toPandas()  # small table OK to convert; if large, keep as Spark DF
+
+# compute MoM growth in pandas safely (only if data present)
+mom_growth = []
+if len(monthly) > 0:
+    monthly["monthly_revenue"] = monthly["monthly_revenue"].astype(float)
+    monthly["mom_growth_pct"] = monthly["monthly_revenue"].pct_change().fillna(0.0) * 100.0
+    # convert to list of dicts
+    for _, row in monthly.iterrows():
+        mom_growth.append({"year": int(row["year"]), "month": int(row["month"]), "monthly_revenue": float(row["monthly_revenue"]), "mom_growth_pct": float(row["mom_growth_pct"]) })
+
+# 6) Build KPI DataFrame and save as Delta
+kpi_row = [{
+    "total_revenue": total_revenue,
+    "total_orders": total_orders,
+    "total_items": total_items,
+    "total_customers": total_customers,
+    "avg_order_value": avg_order_value,
+    "avg_price_per_item": avg_price_per_item,
+    "avg_items_per_order": avg_items_per_order,
+    "repeat_customer_rate": repeat_customer_rate,
+    "purchase_frequency": purchase_frequency,
+    "return_rate_count": return_rate_count,
+    "return_rate_amount": return_rate_amount,
+    "top_products": str(top_products_list),   # simple serialized top list; use separate table for details
+    "refreshed_at": current_timestamp()
+}]
+
+kpis_df = spark.createDataFrame(kpi_row)
+kpis_df.write.format("delta").mode("overwrite").saveAsTable("retail_demo.gold_kpis_final")
+
+# 7) save monthly metrics table as Delta (if you prefer Spark DF version)
+# convert mom_growth list to spark DF
+if len(mom_growth) > 0:
+    mom_spark = spark.createDataFrame(mom_growth)
+    mom_spark.write.format("delta").mode("overwrite").saveAsTable("retail_demo.gold_monthly_metrics")
+else:
+    # create empty table with columns
+    spark.createDataFrame([], schema="year INT, month INT, monthly_revenue DOUBLE, mom_growth_pct DOUBLE").write.format("delta").mode("overwrite").saveAsTable("retail_demo.gold_monthly_metrics")
+
+# persist top_products separately for dashboard
+top_products.write.format("delta").mode("overwrite").saveAsTable("retail_demo.gold_top_products")
+
+# show KPIs
+display(kpis_df)
+display(spark.table("retail_demo.gold_top_products"))
+display(spark.table("retail_demo.gold_monthly_metrics"))

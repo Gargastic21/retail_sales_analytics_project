@@ -1,0 +1,86 @@
+Retail Sales Analytics Platform using Medallion Architecture in Databricks
+
+
+📌 Business Use Case
+
+A mid-size retail company is struggling to consolidate and analyze its sales transactions that are spread across different sources and formats.
+The business wants a unified analytics solution to:
+
+clean messy data (inconsistent formats, missing values, duplicates),
+
+build a single source of truth for sales, customers, and products,
+
+monitor KPIs such as revenue, return rate, repeat customers, average order value,
+
+enable business teams to explore insights across product, category, customer, and time dimensions,
+
+and use dashboards for data-driven decisions (e.g., inventory, pricing, promotions).
+
+Databricks Free Edition with a Medallion Architecture (Bronze → Silver → Gold) is chosen to demonstrate how raw retail data can be transformed into actionable insights.
+
+
+📌 Business Problem Statement
+
+The retail business faces the following challenges:
+
+Messy Transaction Data
+
+Dates recorded in multiple formats (yyyy-MM-dd, dd/MM/yyyy, etc.)
+
+Price fields with mixed symbols ($19.99, 19.99, missing values)
+
+Inconsistent product names (T-shirt XL, tshirt xl)
+
+Duplicates and missing customer IDs
+
+Limited Visibility into KPIs
+
+No clear picture of total revenue, orders, or customer lifetime value (CLV)
+
+Unable to track returns, refund impact, or return rates
+
+No insights on monthly growth trends, top products, or category performance
+
+Difficulty in Customer Analysis
+
+Hard to identify repeat vs one-time customers
+
+No way to measure purchase frequency or churn risk
+
+Lack of understanding of product-customer associations
+
+Manual Reporting Pain Points
+
+Business teams spend days cleaning spreadsheets
+
+Insights are delayed and not real-time
+
+Decisions (inventory, promotions, pricing) are reactive, not proactive
+
+
+
+Proposed Solution (Your Project)
+
+Bronze Layer: Ingest messy CSV/Parquet files manually (as simulated in Databricks free edition).
+
+Silver Layer: Clean and standardize data (fix dates, remove $ from prices, normalize product names, handle missing/negative quantities, remove duplicates).
+
+Gold Layer: Create one rich aggregate Delta table with grouped metrics across product, customer, category, and time (year, month, date).
+
+KPIs Derived:
+
+Total Revenue, Total Orders, Total Items Sold
+
+Average Order Value (AOV), Average Price per Item
+
+Repeat Customer Rate, Purchase Frequency
+
+Return Rate (by count & value)
+
+Monthly Sales Trends & MoM Growth
+
+Top Products by Revenue and Quantity
+
+Customer Lifetime Value (CLV) approximation
+
+Dashboard: Build a Databricks SQL Dashboard showing trends, category performance, top products, and customer insights.
